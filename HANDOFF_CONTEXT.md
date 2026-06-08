@@ -26,43 +26,54 @@ WORK COMPLETED
 - Initialized CUTLASS submodule (was empty): checked out to 291300ff (v4.3.0-89-g291300ff)
 - Rebased PR #118 onto current master (f8804af6)
 - Added compile-time architecture macro `PEARL_GEMM_ARCH` to setup.py (e.g., sm_90a -> 90, sm_121a -> 121)
-- Added architecture guards to heuristics.hpp: pipeline cap for Blackwell (3 stages), original for Hopper
 - Added architecture guards to kernel_traits.hpp: MMA atom selection (SM80 vs GMMA), SMEM layout conditional
 - Added architecture guards to collective_epilogue.hpp: direct gmem store vs SMEM C + TMA
 - Fixed AxEB_size bug in heuristics.hpp (operator precedence: original was wrong, now corrected)
-- Added stages=3 kernel configs for 64x128x64 and 64x64x64 tiles
-- Increased Blackwell pipeline cap from 2 to 3 stages
+- Fixed setup.py platform tag for aarch64 (DGX Spark): linux_{platform.machine()} instead of hardcoded linux_x86_64
+- Rewrote get_pipeline_stages() in heuristics.hpp to correctly model the UNION SMEM layout introduced in PR #118. Previous formula double-counted denoise buffers, producing a pessimistic universal 2-stage cap. New formula computes union_size(stages) = max(AB*stages, denoise_phase) + scales + overhead, and finds the largest compiled stage count that fits in sharedMemPerBlockOptin (naturally adapts to Blackwell 99 KB vs Hopper 227 KB).
+- Added TestBitIdenticalTranscript to test_pearl_gemm.py with three tests: determinism on canonical tile, comparison against saved reference tensors for cross-arch validation, and a reference-generation helper.
 - Pushed all changes to fork: https://github.com/fps-russia/pearl branch `blackwell-121a`
-- Created uv virtual environment with Python 3.12.13 (needed for torch compilation)
 
 CURRENT STATE
 -------------
-- Repo: pearl-research-labs/pearl at /Users/ryland/pearl
+- Repo: fps-russia/pearl at /home/sparky/pearl
 - Branch: blackwell-121a (based on master f8804af6)
 - Remote: origin (pearl-research-labs), fps (fps-russia)
-- HEAD: cb9d4abf (PR #118 commits) + our architecture guard modifications
-- 5 modified files in working tree, 3 untracked docs
+- HEAD: 194ac405 (heuristic fix + bit-identical transcript test)
+- Clean working tree (all changes committed)
 - CUTLASS submodule initialized at miner/pearl-gemm/third_party/cutlass
 - MCP servers enabled and configured
-- .venv created with Python 3.12.13 (torch dependencies not fully installed on macOS)
 - PR #118 is unmerged (open, blocked), PR #130 is unmerged (open, blocked)
 
 PENDING TASKS
 -------------
-- Clone and test on DGX Spark: git clone https://github.com/fps-russia/pearl.git && git checkout blackwell-121a
+IMMEDIATE (DGX Spark):
+- Clone and checkout: git clone https://github.com/fps-russia/pearl.git && git checkout blackwell-121a
 - Build with: PEARL_GEMM_ARCH=sm_121a pip install -e .
 - Run full test suite: pytest miner/pearl-gemm/tests -v
+- Run bit-identical determinism test: pytest miner/pearl-gemm/tests/test_pearl_gemm.py -k "test_canonical_tile_determinism" -v
 - Verify the controversial 128x256x128, R=128 test case: pytest -k 'matmul_config1'
-- If tests pass, proceed with SM80 mma.sync optimizations (register pressure, pipeline tuning)
 - If 128x256x128 fails, investigate root cause (PR #130 claim vs PR #118 results)
-- Profile SMEM usage with nv-nsight-compute for all Blackwell tile configs
-- Benchmark stages=2 vs stages=3 for 64x128x64 and 128x128x64 tiles
-- Implement register pressure reduction (warpgroup_reg_alloc tuning)
+
+OPTIMIZATION (if tests pass):
+- Profile actual SMEM usage with nv-nsight-compute for all Blackwell tile configs
+- Benchmark stages=2 vs stages=3 for 128x128x64 tile (heuristic now correctly selects 3 on Blackwell)
+- Implement register pressure reduction (audit collective_mainloop.hpp for spills, tune warpgroup_reg_alloc)
+- Benchmark TMA store vs direct gmem for epilogue (currently using Path 3 direct gmem)
+- Test cluster configurations (cM=2, cN=1 or cM=1, cN=2) on Blackwell
+
+CROSS-ARCH VALIDATION:
+- Generate reference tensors on a trusted Hopper machine:
+  pytest miner/pearl-gemm/tests/test_pearl_gemm.py -k "test_canonical_tile_save_reference" -v
+- Copy ref_transcript_hopper.pt to Blackwell DGX Spark
+- Run cross-arch comparison:
+  pytest miner/pearl-gemm/tests/test_pearl_gemm.py -k "test_canonical_tile_vs_saved_reference" -v
+
+RESEARCH:
 - Research raw PTX tcgen05 possibility (very high risk, likely impossible for SM121 int8)
 - Track CUTLASS upstream for SM121 int8 support
 - Add GB10 CI runner to CI pipeline
 - Run 24-hour testnet mining validation
-- All todo items were completed in planning phase, now need to execute on DGX Spark
 
 KEY FILES
 ---------
@@ -72,11 +83,12 @@ KEY FILES
 - miner/pearl-gemm/csrc/gemm/kernel_traits.hpp - MMA atom selection, SMEM layouts
 - miner/pearl-gemm/csrc/gemm/collective_mainloop.hpp - GEMM mainloop, ldmatrix staging
 - miner/pearl-gemm/csrc/gemm/collective_epilogue.hpp - Epilogue, denoise, SMEM management
-- miner/pearl-gemm/csrc/gemm/heuristics.hpp - Pipeline stage calculation (bug fixed)
+- miner/pearl-gemm/csrc/gemm/heuristics.hpp - Pipeline stage calculation (union model fixed, architecture-aware)
 - miner/pearl-gemm/csrc/gemm/pearl_gemm_kernel.h - Kernel launch, warpgroup sync
-- miner/pearl-gemm/csrc/gemm/pearl_gemm_api.cpp - Python API, reference backend
-- miner/pearl-gemm/setup.py - Build configuration, CUDA arch selection, PEARL_GEMM_ARCH macro
-- miner/pearl-gemm-build-utils/.../default_compiled_kernels.py - Kernel tile configs (stages=3 added)
+- miner/pearl-gemm/csrc/gemm/pearl_gemm_api.cpp - Python API, kernel dispatch
+- miner/pearl-gemm/setup.py - Build configuration, CUDA arch selection, PEARL_GEMM_ARCH macro, aarch64 platform fix
+- miner/pearl-gemm/tests/test_pearl_gemm.py - Unit tests + new TestBitIdenticalTranscript
+- miner/pearl-gemm-build-utils/.../default_compiled_kernels.py - Kernel tile configs
 
 IMPORTANT DECISIONS
 -------------------
@@ -86,6 +98,7 @@ IMPORTANT DECISIONS
 - The SM80 mma.sync path is viable and can be optimized further (10-30% gain potential)
 - Bit-identical PoUW transcript is the most critical invariant - any kernel change must preserve this
 - AxEB_size bug fix: original `(sizeof(half)*m + n)*R` had operator precedence issue, corrected to `sizeof(half)*(m+n)*R`
+- Heuristic SMEM model was WRONG: it treated denoise buffers as additive to mainloop SMEM, but kernel_traits.hpp uses a UNION (only A+B OR Phase1 OR Phase2 is live at any time). The corrected formula unlocks higher stage counts for smaller tiles on Blackwell.
 - Architecture guards use compile-time `#if PEARL_GEMM_ARCH >= 100` to differentiate Blackwell from Hopper
 - Fork created at fps-russia/pearl for DGX Spark testing
 - Build uses PEARL_GEMM_ARCH=sm_121a environment variable to target Blackwell
