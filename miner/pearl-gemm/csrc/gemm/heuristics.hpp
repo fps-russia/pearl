@@ -38,7 +38,7 @@ static inline int get_pipeline_stages(int tile_size_m, int tile_size_n,
   int const AxEB_size =
       skip_denoising
           ? 0
-          : (sizeof(cutlass::half_t) * tile_size_m + tile_size_n) * R;
+          : sizeof(cutlass::half_t) * (tile_size_m + tile_size_n) * R;
   int const C_union_size = std::max(C_size, AxEB_size);
   // A_scales, B_scales (fp32)
   int const scale_size = (tile_size_m + tile_size_n) * sizeof(float);
