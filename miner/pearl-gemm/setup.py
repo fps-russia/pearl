@@ -145,7 +145,7 @@ NOISING_B_KERNELS = [k for k in kernel_configs.noising_b_kernels if k.R in ENABL
 def get_platform() -> str:
     """Returns the platform name as used in wheel filenames."""
     if sys.platform.startswith("linux"):
-        return "linux_x86_64"
+        return f"linux_{platform.machine()}"
     raise ValueError(f"Unsupported platform: {sys.platform}")
 
 
