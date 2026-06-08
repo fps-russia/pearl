@@ -24,36 +24,63 @@ static inline int get_swizzle_size(int K, int tile_size_n,
 }
 
 static inline int get_pipeline_stages(int tile_size_m, int tile_size_n,
-                                      int tile_size_k, int R,
-                                      bool skip_denoising,
-                                      cudaDeviceProp const* const dprops) {
+                                       int tile_size_k, int R,
+                                       bool skip_denoising,
+                                       cudaDeviceProp const* const dprops) {
   int const smem_size = dprops->sharedMemPerBlockOptin;
-  // A, B (int8) and their pipeline (2 int64 mbarriers per stage)
-  int const AB_one_stage_size = (tile_size_m * tile_size_k) +
-                                (tile_size_n * tile_size_k) +
-                                (2 * sizeof(int64_t));
-  // C (bf16)
-  int const C_size = tile_size_m * tile_size_n * sizeof(cutlass::bfloat16_t);
-  // AxEBL, EBR overlap with C for load.
-  int const AxEB_size =
+
+  // Mainloop A + B per stage (int8).  The +16 accounts for the two int64
+  // mbarriers that CUTLASS PipelineTmaAsync reserves per stage.
+  int const AB_per_stage = (tile_size_m * tile_size_k) +
+                           (tile_size_n * tile_size_k) +
+                           (2 * sizeof(int64_t));
+
+  // Denoise phase size.
+  // kernel_traits.hpp places denoise buffers in a UNION with mainloop SMEM:
+  //   union { A+B;  EAL+EARxBpEB;  AxEBL+EBR; }
+  // Only ONE of those groups is live at any time, so the peak SMEM is the
+  // maximum of the three groups, not their sum.
+  // A single denoise phase holds two buffers of shape (M,R) + (N,R) in fp16.
+  int const denoise_phase_size =
       skip_denoising
           ? 0
           : sizeof(cutlass::half_t) * (tile_size_m + tile_size_n) * R;
-  int const C_union_size = std::max(C_size, AxEB_size);
+
   // A_scales, B_scales (fp32)
   int const scale_size = (tile_size_m + tile_size_n) * sizeof(float);
-  int const rest_size = 128;
 
-  int const pipeline_stages =
-      (smem_size - (C_union_size + scale_size + rest_size)) / AB_one_stage_size;
-  // Blackwell consumer (sm_120/121) has a 99 KB SMEM cap per CTA. With
-  // skip_denoising=false the kernel also keeps 4 denoise buffers
-  // (EAL+EBR+AxEBL+EARxBpEB) live, totalling 4*sizeof(half)*max(M,N)*R bytes,
-  // which the original heuristic doesn't account for. Clamp to a stage count
-  // we know fits and have compiled kernels for on consumer Blackwell.
-  // Cap stages at our compiled set (2). Avoids "no kernel found" at runtime.
-  int const safe_stages = std::min(pipeline_stages, 2);
-  return std::max(2, safe_stages);  // floor at 2 — every compiled config has stages >= 2
+  // Fixed overhead for pipeline barriers, struct alignment, and swizzle padding.
+  // CUTLASS PipelineTmaAsync shared storage is ~256 bytes per stage for the
+  // mainloop plus ~256 bytes for the two denoise pipelines.  We budget 1 KB
+  // conservatively; this was validated against the 128x256x128 stages=2 tile
+  // which fits in ~98.5 KB on GB10 (99 KB optin cap).
+  int const fixed_overhead = 1024;
+
+  int const available_for_union = smem_size - scale_size - fixed_overhead;
+  if (available_for_union <= 0) {
+    return 2;  // floor — every compiled config has stages >= 2
+  }
+
+  // Iteratively find the largest stage count whose total SMEM fits.
+  // Union size = max(mainloop_AB, denoise_phase).
+  // mainloop_AB grows with stages; denoise_phase is constant.
+  int max_stages = 0;
+  for (int stages = 1; stages <= 8; ++stages) {
+    int const mainloop_size = AB_per_stage * stages;
+    int const union_size = std::max(mainloop_size, denoise_phase_size);
+    if (union_size <= available_for_union) {
+      max_stages = stages;
+    } else {
+      break;
+    }
+  }
+
+  // Cap at 3 because that is the highest stage count we currently compile
+  // for any tile (see default_compiled_kernels.py / static_switch_matmul.h).
+  int const capped_stages = std::min(max_stages, 3);
+
+  // Floor at 2 because we do not compile stages=1 kernels.
+  return std::max(2, capped_stages);
 }
 
 static inline int get_num_k_blocks(int MN, int tile_size_mn, int K,
