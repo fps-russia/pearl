@@ -30,6 +30,7 @@ DISABLE_DEBUG_MODE = os.getenv("PEARL_GEMM_DISABLE_DEBUG_MODE", "FALSE") == "TRU
 from pearl_gemm_build_utils.kernel_configs.default_compiled_kernels import (  # noqa: E402
     KERNEL_CONFIGS,
 )
+from pearl_gemm_build_utils.kernel_configs import MatmulKernelConfig  # noqa: E402
 
 # Get kernel configs and filter by Rs
 kernel_grid = KERNEL_CONFIGS
@@ -1221,3 +1222,154 @@ class TestInnerHashCounting(TestPearlGEMMBase):
             matmul_config,
         )
         assert counter.item() == expected, f"Count mismatch: {counter.item()} != {expected}"
+
+
+class TestBitIdenticalTranscript(TestPearlGEMMBase):
+    """
+    Level 2 validation: verify PoUW hash-transcript determinism and
+    cross-architecture bit-identicality.
+
+    The PoUW protocol uses xor_reduction(tCrC) to build a transcript that is
+    later fed into BLAKE3.  If the transcript differs by even one bit between
+    architectures the ZK proof will fail and mining rewards are lost.
+
+    Because the transcript lives in device registers and is not exposed to
+    Python, we validate bit-identicality via the GEMM outputs that are
+    derived from the same tCrC accumulator:
+      - C (the scaled GEMM output)
+      - ApEA / BpEB / AxEBL / EARxBpEB (noising intermediates)
+    If all of these are bit-identical, the xor_reduction path was identical.
+    """
+
+    # Canonical mining tile — must be bit-identical across all archs.
+    CANONICAL_TILE = dict(
+        m=8192,
+        n=8192,
+        k=512,
+        tile_size_m=128,
+        tile_size_n=256,
+        tile_size_k=128,
+        R=128,
+        pipeline_stages=2,
+    )
+
+    @pytest.mark.slow
+    def test_canonical_tile_determinism(self):
+        """Run the canonical tile multiple times; outputs must be identical."""
+        gemm_params = GEMMParam(
+            **self.CANONICAL_TILE,
+            matmul_config=MatmulKernelConfig(
+                tile_size_m=128,
+                tile_size_n=256,
+                tile_size_k=128,
+                R=128,
+                pipeline_stages=2,
+                cM=1,
+                cN=1,
+            ),
+        )
+        tg = GemmTensorGenerator(gemm_params)
+        tg.generate()
+
+        self.run_noisy_gemm(tg, gemm_params)
+
+        # Capture reference outputs on first run
+        C_ref = tg.C.clone()
+        ApEA_ref = tg.ApEA.clone()
+        BpEB_ref = tg.BpEB.clone()
+        AxEBL_ref = tg.AxEBL.clone()
+        EARxBpEB_ref = tg.EARxBpEB.clone()
+
+        for _ in range(100):
+            tg.C.zero_()
+            tg.ApEA.zero_()
+            tg.BpEB.zero_()
+            tg.AxEBL.zero_()
+            tg.EARxBpEB.zero_()
+            self.run_noisy_gemm(tg, gemm_params)
+            assert torch.equal(tg.C, C_ref), "C output not deterministic"
+            assert torch.equal(tg.ApEA, ApEA_ref), "ApEA output not deterministic"
+            assert torch.equal(tg.BpEB, BpEB_ref), "BpEB output not deterministic"
+            assert torch.equal(tg.AxEBL, AxEBL_ref), "AxEBL output not deterministic"
+            assert torch.equal(tg.EARxBpEB, EARxBpEB_ref), "EARxBpEB output not deterministic"
+
+    @pytest.mark.slow
+    def test_canonical_tile_vs_saved_reference(self):
+        """Compare current-arch outputs against a saved reference tensor file.
+
+        To generate the reference file on your reference architecture (e.g. Hopper):
+
+            pytest miner/pearl-gemm/tests/test_pearl_gemm.py \
+                -k "test_canonical_tile_save_reference" \
+                --tb=short -v
+
+        Then copy tests/ref_transcript_hopper.pt to your target architecture
+        (e.g. Blackwell DGX Spark) and run this test.
+        """
+        ref_path = os.path.join(
+            os.path.dirname(__file__), "ref_transcript_hopper.pt"
+        )
+        if not os.path.exists(ref_path):
+            pytest.skip(f"Reference file not found: {ref_path}")
+
+        gemm_params = GEMMParam(
+            **self.CANONICAL_TILE,
+            matmul_config=MatmulKernelConfig(
+                tile_size_m=128,
+                tile_size_n=256,
+                tile_size_k=128,
+                R=128,
+                pipeline_stages=2,
+                cM=1,
+                cN=1,
+            ),
+        )
+        tg = GemmTensorGenerator(gemm_params)
+        tg.generate()
+        self.run_noisy_gemm(tg, gemm_params)
+
+        ref = torch.load(ref_path, map_location="cpu", weights_only=True)
+        assert torch.equal(tg.C.cpu(), ref["C"]), (
+            "C mismatch against reference — transcript bit-identicality FAILED"
+        )
+        assert torch.equal(tg.ApEA.cpu(), ref["ApEA"]), "ApEA mismatch against reference"
+        assert torch.equal(tg.BpEB.cpu(), ref["BpEB"]), "BpEB mismatch against reference"
+        assert torch.equal(tg.AxEBL.cpu(), ref["AxEBL"]), "AxEBL mismatch against reference"
+        assert torch.equal(tg.EARxBpEB.cpu(), ref["EARxBpEB"]), "EARxBpEB mismatch against reference"
+
+    def test_canonical_tile_save_reference(self):
+        """Generate and save reference tensors for cross-arch comparison.
+
+        Run this on your trusted reference architecture (e.g. sm_90a Hopper)
+        to produce ref_transcript_hopper.pt.  The resulting file should be
+        committed to the repo so that CI / other architectures can compare.
+        """
+        gemm_params = GEMMParam(
+            **self.CANONICAL_TILE,
+            matmul_config=MatmulKernelConfig(
+                tile_size_m=128,
+                tile_size_n=256,
+                tile_size_k=128,
+                R=128,
+                pipeline_stages=2,
+                cM=1,
+                cN=1,
+            ),
+        )
+        tg = GemmTensorGenerator(gemm_params)
+        tg.generate()
+        self.run_noisy_gemm(tg, gemm_params)
+
+        ref_path = os.path.join(
+            os.path.dirname(__file__), "ref_transcript_hopper.pt"
+        )
+        torch.save(
+            {
+                "C": tg.C.cpu(),
+                "ApEA": tg.ApEA.cpu(),
+                "BpEB": tg.BpEB.cpu(),
+                "AxEBL": tg.AxEBL.cpu(),
+                "EARxBpEB": tg.EARxBpEB.cpu(),
+            },
+            ref_path,
+        )
