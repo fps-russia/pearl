@@ -1,0 +1,23 @@
+services:
+  pearl-miner:
+    image: vllm_miner:blackwell-121a
+    container_name: pearl-miner
+    restart: unless-stopped
+    gpus: all
+    network_mode: host
+    shm_size: 8g
+    environment:
+      PEARLD_RPC_URL: ${PEARLD_RPC_URL:-http://localhost:44107}
+      PEARLD_RPC_USER: ${PEARLD_RPC_USER:-rpcuser}
+      PEARLD_RPC_PASSWORD: ${PEARLD_RPC_PASSWORD:-rpcpass}
+      PEARLD_MINING_ADDRESS: ${PEARLD_MINING_ADDRESS:-}
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    command: >
+      pearl-ai/Llama-3.1-8B-Instruct-pearl
+      --host 0.0.0.0
+      --port 8000
+      --max-model-len 8192
+      --gpu-memory-utilization 0.9
+      --enforce-eager

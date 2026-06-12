@@ -47,6 +47,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 COPY miner/pearl-gemm/ ./miner/pearl-gemm/
 COPY miner/pearl-gemm-build-utils/ ./miner/pearl-gemm-build-utils/
 
+ENV PEARL_GEMM_ARCH=sm_121a
+
 # Build CUDA kernels (pearl-gemm)
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=cache,target=/usr/local/cargo/registry \
